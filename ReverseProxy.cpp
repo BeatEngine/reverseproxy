@@ -3,44 +3,12 @@
 #include <string.h>
 
 #include <boost/asio.hpp>
-//#include <pthread.h>
+
+#define _OPEN_THREADS
+#include <pthread.h>
 
 #define SO_RCVTIMEO 5;
 #define SO_SNDTIMEO 5;
-
-std::string read_(boost::asio::ip::tcp::socket & socket) 
-{
-        unsigned char* buffer= (unsigned char*)malloc(500000000);
-        boost::asio::mutable_buffers_1 buf(buffer, 500000000);
-        boost::asio::read(socket, boost::asio::buffer(buf),boost::asio::transfer_at_least(1));
-        std::string data = boost::asio::buffer_cast<const char*>(boost::asio::buffer(buf));
-        free(buffer);
-        return data;
-}
-
-std::string read_(boost::asio::ip::tcp::socket & socket, long size) 
-{
-        unsigned char* buffer= (unsigned char*)malloc(500000000);
-        boost::asio::mutable_buffers_1 buf(buffer, 500000000);
-        size_t recv = 0;
-        while(recv < size)
-        {
-            recv += boost::asio::read(socket, boost::asio::buffer(buf),boost::asio::transfer_at_least(1));
-        }
-        std::string data = boost::asio::buffer_cast<const char*>(boost::asio::buffer(buf));
-        free(buffer);
-        return data;
-}
-
-void send_(boost::asio::ip::tcp::socket & socket, const std::string& message)
-{
-    size_t sent = 0;
-    sent += boost::asio::write( socket, boost::asio::buffer((const void*)(message.c_str()), message.size()));
-    while(sent < message.size())
-    {
-        sent += boost::asio::write( socket, boost::asio::buffer((const void*)(message.c_str()+sent), message.size()-sent));
-    }
-}
 
 
 
@@ -372,6 +340,220 @@ std::string generateResposehead(size_t sizeBytes, std::string type = "text/html"
     return "HTTP/1.1 200 OK\r\ncontent-type: "+type+"; charset=utf-8;\r\nContent-Length: "+ std::to_string(sizeBytes) +"\r\nConnection: keep-alive\r\n\r\n";
 }
 
+void httpForward(boost::asio::ip::tcp::socket& source, boost::asio::io_service& io_service)
+{
+    unsigned char buffer[2048];
+    int recv = 0;
+    int snd = 0;
+    long transferSize = 0;
+    long transfered = 0;
+    int w = 0;
+    long av;
+
+    std::string targetDomain = "";
+    int targetPort = 80;
+    boost::asio::ip::tcp::endpoint target;
+    bool foundTarget = false;
+
+    boost::asio::ip::tcp::socket targetSocket(io_service);
+
+    bool requesting = true;
+
+    while (requesting)
+    {
+        av = source.available();
+        if(av > 2048)
+        {
+            av = 2048;
+        }
+        if(av == 0)
+        {
+            int stp = 0;
+            while (av == 0)
+            {
+                if(stp > 1000)
+                {
+                    if(transfered == 0)
+                    {
+                        break;
+                    }
+                    requesting = false;
+                    break;
+                }
+                usleep(100);
+                av = source.available();
+                stp ++;
+            }
+            if(av > 2048)
+            {
+                av = 2048;
+            }
+            if(!requesting)
+            {
+                break;
+            }
+        }
+        try
+        {
+            recv = source.read_some(boost::asio::buffer(buffer, av));
+        }
+        catch(std::exception e)
+        {
+            return;
+        }
+        if(!foundTarget)
+        {
+            std::string buf((const char*)buffer);
+            int h = buf.find("Host:") + 4;
+            while(buffer[h] != '\r' && buffer[h] != '\n' && h > 4)
+            {
+                if(buffer[h] == ':')
+                {
+                    h++;
+                    int p = h;
+                    while (buffer[p] != '\r' && buffer[p] != '\n')
+                    {
+                        if(buffer[p] == ':')
+                        {
+                            p++;
+                            std::string prt = "";
+                            while (buffer[p] != '\r' && buffer[p] != '\n')
+                            {
+                                prt += buffer[p];
+                                p++;
+                            }
+                            targetPort = atoi(prt.c_str());
+                        break;
+                        }
+                        else
+                        {
+                            targetDomain += buffer[p];
+                        }
+                        p++;
+                    }
+                    if(targetDomain[0] == ' ')
+                    {
+                        targetDomain = targetDomain.substr(1);
+                    }
+                    break;
+                }
+                h++;
+            }
+        }
+
+        if(!foundTarget && targetDomain.length() > 0 && targetDomain != "localhost")
+        {
+            boost::asio::ip::tcp::resolver resolver(io_service);
+            boost::asio::ip::tcp::resolver::query query(targetDomain, std::to_string(targetPort));
+            boost::asio::ip::tcp::resolver::iterator iter = resolver.resolve(query);
+            target = iter->endpoint();
+            HttpRequest request(std::string((const char*)buffer));
+            if(recv > 0)
+            {
+                printf("%s %s %s   %s\n",request.method.c_str(), request.path.c_str(), request.getQuery().c_str(), request.attributes.get("content-type").c_str());
+            }
+
+            targetSocket.connect(target);
+            foundTarget = targetSocket.is_open();
+        }
+        if(!foundTarget)
+        {
+            break;
+        }
+
+        if(recv > 0)
+        {
+            snd = 0;
+            try
+            {
+                while (snd < recv)
+                {
+                    snd += targetSocket.write_some(boost::asio::buffer(buffer+snd, recv-snd));
+                }
+            }
+            catch(std::exception e)
+            {
+                return;
+            }
+            if(snd != -1)
+            {
+                transfered += snd;
+            }
+        }
+        transferSize += recv;
+
+    }
+
+    transfered = 0;
+    transferSize = 0;
+
+    while (foundTarget)
+    {
+        av = targetSocket.available();
+        if(av > 2048)
+        {
+            av = 2048;
+        }
+        if(av == 0)
+        {
+            int stp = 0;
+            while (av == 0)
+            {
+                if(stp > 1000)
+                {
+                    if(transfered == 0)
+                    {
+                        break;
+                    }
+                    return;
+                }
+                usleep(100);
+                av = targetSocket.available();
+                stp ++;
+            }
+            if(av > 2048)
+            {
+                av = 2048;
+            }
+        }
+        try
+        {
+            recv = targetSocket.read_some(boost::asio::buffer(buffer, av));
+        }
+        catch(std::exception e)
+        {
+            return;
+        }
+
+        if(recv > 0)
+        {
+            snd = 0;
+            try
+            {
+                while (snd < recv)
+                {
+                    snd += source.write_some(boost::asio::buffer(buffer+snd, recv-snd));
+                }
+            }
+            catch(std::exception e)
+            {
+                return;
+            }
+            if(snd != -1)
+            {
+                transfered += snd;
+            }
+        }
+        transferSize += recv;
+
+    }
+
+    if(foundTarget)
+    {
+        targetSocket.close();
+    }
+}
+
 void transfer(boost::asio::ip::tcp::socket & source, boost::asio::ip::tcp::socket & destination, bool response = false, int destport = 80, int targetport = 80)
 {
     unsigned char buffer[2048];
@@ -420,21 +602,33 @@ void transfer(boost::asio::ip::tcp::socket & source, boost::asio::ip::tcp::socke
         }
         if(transfered == 0)
         {
-            /*std::string buf((const char*)buffer);
-            int h = buf.find("Host:") + 7;
-            while(buffer[h] != '\r' || buffer[h] != '\n')
+            if(true||!response)
             {
-                if(buffer[h] == ':')
+                
+                std::string buf((const char*)buffer);
+                int h = buf.find("Host:") + 4;
+                while(buffer[h] != '\r' && buffer[h] != '\n' && h > 4)
                 {
-                    std::string np = std::to_string(targetport);
-                    for(int i = 0; i < np.length(); i++)
+                    if(buffer[h] == ':')
                     {
-                        buffer[h+1+i] = np[i];
+                        std::string np = destination.remote_endpoint().address().to_string()+":"+std::to_string(targetport);
+                        int p = h;
+                        for(int i = 0; i < np.length(); i++)
+                        {
+                            buffer[h+1+i] = np[i];
+                            p = h+1+i;
+                        }
+                        p++;
+                        while (buffer[p] != '\r' && buffer[p] != '\n')
+                        {
+                            buffer[p] = ' ';
+                            p++;
+                        }
+                        break;
                     }
-                    break;
+                    h++;
                 }
-                h++;
-            }*/
+            }
 
             HttpRequest request(std::string((char*)buffer));
             if(response)
@@ -529,6 +723,41 @@ void transfer(boost::asio::ip::tcp::socket & source, boost::asio::ip::tcp::socke
     pthread_exit(NULL);
 }*/
 
+void* serverThread(void* endpoints)
+{
+    boost::asio::ip::tcp::endpoint server = ((boost::asio::ip::tcp::endpoint*)endpoints)[0];
+    boost::asio::ip::tcp::endpoint target = ((boost::asio::ip::tcp::endpoint*)endpoints)[1];
+    boost::asio::io_service io_service;
+    boost::asio::ip::tcp::acceptor acceptor(io_service, server);
+    while(true)
+    {
+        boost::asio::ip::tcp::socket sockets[2] = {boost::asio::ip::tcp::socket(io_service), boost::asio::ip::tcp::socket(io_service)};
+        acceptor.accept(sockets[0]);
+        sockets[1].connect(target);
+        transfer(sockets[0], sockets[1]);
+        transfer(sockets[1], sockets[0], true);
+        sockets[0].close();
+        sockets[1].close();
+    }
+    pthread_exit(0);
+}
+
+void* webProxyThread(void* portPointer)
+{
+    int port = *(int*)(portPointer);
+    boost::asio::io_service io_service;
+    boost::asio::ip::tcp::endpoint serverEndpoint(boost::asio::ip::tcp::v4(), port);
+    boost::asio::ip::tcp::acceptor acceptor(io_service, serverEndpoint);
+    boost::asio::ip::tcp::socket server(io_service);
+    while(true)
+    {
+        acceptor.accept(server);
+        httpForward(server, io_service);
+        server.close();
+    }
+    pthread_exit(0);
+}
+
 int main()
 {
     int port = 8082;
@@ -546,10 +775,21 @@ int main()
     /*boost::asio::ip::tcp::socket socket(io_service);
     boost::asio::ip::tcp::socket socketClient(io_service);*/
 
-    
+    /** Reverse Proxy */
+    //int localServerPort = 80; //Enter your server port
+    //std::string localServerHost = "185.137.168.188"; //Enter your server ip
+    //boost::asio::ip::tcp::endpoint threadEndpoints[2] = {boost::asio::ip::tcp::endpoint(boost::asio::ip::tcp::v4(), targetPort), boost::asio::ip::tcp::endpoint(boost::asio::ip::address::from_string(localServerHost), localServerPort)};
+    //pthread_t server;
+    //pthread_create(&server, 0, serverThread, threadEndpoints);
+    /** End Reverse Proxy */
 
-    pthread_t threads[8];
-    int t = 0;
+    /** Web Proxy */
+    pthread_t webProxy;
+    int clientConnectPort = 8088;
+    pthread_create(&webProxy, 0, webProxyThread, &clientConnectPort);
+    /** End Web Proxy */
+
+    /** Local reverse proxy */
     while(true)
     {
         boost::asio::ip::tcp::socket sockets[2] = {boost::asio::ip::tcp::socket(io_service), boost::asio::ip::tcp::socket(io_service)};
