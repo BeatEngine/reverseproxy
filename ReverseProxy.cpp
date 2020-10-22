@@ -10,7 +10,18 @@
 #define SO_RCVTIMEO 5;
 #define SO_SNDTIMEO 5;
 
-
+#ifndef usleep
+    #include <time.h>
+    void wait(long micros)
+    {
+        clock_t start = clock();
+        while ((clock()-start)/(CLOCKS_PER_SEC/1000000) < micros)
+        {
+            
+        }
+    }
+    #define usleep(x) wait(x);
+#endif
 
 
 class StringMap
@@ -381,6 +392,7 @@ void httpForward(boost::asio::ip::tcp::socket& source, boost::asio::io_service& 
                     break;
                 }
                 usleep(100);
+                
                 av = source.available();
                 stp ++;
             }
