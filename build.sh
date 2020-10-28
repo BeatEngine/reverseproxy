@@ -1,2 +1,2 @@
-g++ ReverseProxy.cpp -static -I include -L lib -lpthread -lboost_system -o ReverseProxy
+g++ ReverseProxy.cpp -I include -L lib -lpthread lib/libboost_system.a -lcrypto -lssl -o ReverseProxy
 
